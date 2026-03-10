@@ -1,0 +1,2374 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import math
+import random
+import re
+import socket
+import sys
+import time
+import urllib.request
+from collections import deque
+from pathlib import Path
+
+from silver_memory_store import build_memory
+from silver_reward_system import evaluate_reward_signal
+from silver_smart_policy import SmartPolicyRuntime
+from silver_meta_policy import MetaPolicyRuntime
+from silver_progress_tracker import ProgressTrackerRuntime
+from silver_task_planner import TaskPlannerRuntime
+from silver_recovery_controller import RecoveryRuntime
+from silver_runtime_config import CONFIG
+from silver_signal_map import SignalMapRuntime
+from silver_mission_scripts import MissionScriptRuntime
+from silver_battle_brain import BattleBrainRuntime
+from silver_capture_planner import CapturePlannerRuntime
+from silver_teacher_guard import TeacherGuardRuntime
+from silver_replay_logger import ReplayLoggerRuntime
+from silver_debug_dashboard import DebugDashboardRuntime
+from silver_wall_avoidance import WallAvoidanceRuntime
+
+
+ACTIONS = {
+    "NONE": 0,
+    "UP": 1 << 6,
+    "DOWN": 1 << 7,
+    # mGBA key bit order: RIGHT=bit4, LEFT=bit5.
+    "LEFT": 1 << 5,
+    "RIGHT": 1 << 4,
+    "A": 1 << 0,
+    "B": 1 << 1,
+    "UP_A": (1 << 6) | (1 << 0),
+    "DOWN_A": (1 << 7) | (1 << 0),
+    "LEFT_A": (1 << 5) | (1 << 0),
+    "RIGHT_A": (1 << 4) | (1 << 0),
+    "START": 1 << 3,
+    "SELECT": 1 << 2,
+}
+
+OVERWORLD_ACTIONS = ["NONE", "UP", "DOWN", "LEFT", "RIGHT", "A", "UP_A", "DOWN_A", "LEFT_A", "RIGHT_A"]
+BATTLE_ACTIONS = ["NONE", "A", "B", "UP", "DOWN", "LEFT", "RIGHT", "UP_A", "DOWN_A", "LEFT_A", "RIGHT_A"]
+INTRO_ACTIONS = ["NONE", "A", "B", "START", "UP", "DOWN", "LEFT", "RIGHT"]
+MANUAL_ACTIONS = ["NONE", "UP", "DOWN", "LEFT", "RIGHT", "A", "B", "START", "SELECT", "UP_A", "DOWN_A", "LEFT_A", "RIGHT_A"]
+MOVEMENT_ACTIONS = {"UP", "DOWN", "LEFT", "RIGHT", "UP_A", "DOWN_A", "LEFT_A", "RIGHT_A"}
+HORIZONTAL_ACTIONS = {"LEFT", "RIGHT", "LEFT_A", "RIGHT_A"}
+VERTICAL_ACTIONS = {"UP", "DOWN", "UP_A", "DOWN_A"}
+
+KEY_A_MASK = 1 << 0
+KEY_B_MASK = 1 << 1
+KEY_SELECT_MASK = 1 << 2
+KEY_START_MASK = 1 << 3
+KEY_RIGHT_MASK = 1 << 4
+KEY_LEFT_MASK = 1 << 5
+KEY_UP_MASK = 1 << 6
+KEY_DOWN_MASK = 1 << 7
+
+NAME_MENU_TOP = 0
+NAME_MENU_LEFT = 0
+NAME_MENU_BOTTOM = 17
+NAME_MENU_RIGHT = 10
+NAME_MENU_ITEMS = 5
+CONTINUE_MENU_MIN_ITEMS = 2
+CONTINUE_MENU_MAX_ITEMS = 4
+
+
+def clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
+def is_boot_map(state):
+    return (
+        state["battle_mode"] == 0
+        and state["map_group"] == 0
+        and state["map_number"] == 0
+        and state["map_status"] in (0, 255)
+    )
+
+
+def host_sync_available(state):
+    if state["host_map_group"] < 0 or state["host_map_number"] < 0:
+        return False
+    if state["host_x"] < 0 or state["host_y"] < 0:
+        return False
+    # Ignore default zero telemetry while Silver is still in boot shell.
+    if (
+        is_boot_map(state)
+        and state["host_map_group"] == 0
+        and state["host_map_number"] == 0
+        and state["host_x"] == 0
+        and state["host_y"] == 0
+        and state["party_count"] == 0
+    ):
+        return False
+    return True
+
+
+def pulse(frame, interval, width=1, offset=0):
+    if interval <= 0:
+        return False
+    # Telemetry commonly advances in 2-frame steps; normalize to avoid
+    # parity-locked pulses that can stall menu automation.
+    tick = frame // 2
+    pos = (tick + offset) % interval
+    return pos < width
+
+
+def _pick_axis_direction(positive_pressed, negative_pressed, positive_name, negative_name, fallback):
+    if positive_pressed and not negative_pressed:
+        return positive_name
+    if negative_pressed and not positive_pressed:
+        return negative_name
+    if positive_pressed and negative_pressed and fallback in {positive_name, negative_name}:
+        return fallback
+    return None
+
+
+def _movement_action_from_mask(mask: int, fallback: str = "NONE"):
+    horiz = _pick_axis_direction(
+        bool(mask & KEY_RIGHT_MASK),
+        bool(mask & KEY_LEFT_MASK),
+        "RIGHT",
+        "LEFT",
+        fallback,
+    )
+    vert = _pick_axis_direction(
+        bool(mask & KEY_DOWN_MASK),
+        bool(mask & KEY_UP_MASK),
+        "DOWN",
+        "UP",
+        fallback,
+    )
+    if horiz and vert:
+        if fallback in HORIZONTAL_ACTIONS:
+            return horiz
+        if fallback in VERTICAL_ACTIONS:
+            return vert
+        return vert
+    return vert or horiz
+
+
+def action_from_mask(mask: int, allowed=None, fallback: str = "NONE"):
+    allowed_set = set(allowed or ACTIONS.keys())
+    mask = int(mask or 0) & 0xFF
+    if mask == 0:
+        return "NONE" if "NONE" in allowed_set else None
+
+    movement = _movement_action_from_mask(mask, fallback=fallback)
+    candidates = []
+    if movement and (mask & KEY_A_MASK):
+        movement_a = f"{movement}_A"
+        if movement_a in allowed_set:
+            candidates.append(movement_a)
+    if mask & KEY_A_MASK and "A" in allowed_set:
+        candidates.append("A")
+    if mask & KEY_B_MASK and "B" in allowed_set:
+        candidates.append("B")
+    if mask & KEY_START_MASK and "START" in allowed_set:
+        candidates.append("START")
+    if mask & KEY_SELECT_MASK and "SELECT" in allowed_set:
+        candidates.append("SELECT")
+    if movement and movement in allowed_set:
+        candidates.append(movement)
+    if not candidates and "NONE" in allowed_set:
+        candidates.append("NONE")
+    return candidates[0] if candidates else None
+
+
+def detect_manual_override_action(state, allowed, fallback: str = "NONE"):
+    raw_mask = int(state.get("raw_keys", 0) or 0) & 0xFF
+    if raw_mask == 0:
+        return None
+
+    ai_mask = 0
+    if int(state.get("bridge_ai_ttl", 0) or 0) > 0:
+        ai_mask = int(state.get("bridge_ai_keys", 0) or 0) & 0xFF
+
+    manual_mask = raw_mask & (~ai_mask & 0xFF)
+    if manual_mask == 0 and ai_mask == 0:
+        manual_mask = raw_mask
+    if manual_mask == 0:
+        return None
+    return action_from_mask(manual_mask, allowed=allowed, fallback=fallback)
+
+
+NAME_ENTRY_GRID = (
+    "ABCDEFGHI",
+    "JKLMNOPQR",
+    "STUVWXYZ ",
+    "-?!/.,   ",
+)
+
+
+def derive_agent_name(model_name: str):
+    raw = re.sub(r"[^A-Za-z0-9]", "", (model_name or "")).upper()
+    if "LLAMA" in raw:
+        return "OLLAMA"
+    if not raw:
+        return "AI"
+    return raw[:7]
+
+
+def build_name_entry_queue(name: str):
+    positions = {}
+    for row, text in enumerate(NAME_ENTRY_GRID):
+        for col, ch in enumerate(text):
+            if ch != " " and ch not in positions:
+                positions[ch] = (row, col)
+
+    row = 0
+    col = 0
+    queue = []
+    # Drive to top-left so typing is deterministic regardless of cursor start.
+    # Use exact grid bounds (4 rows × 9 cols) rather than an arbitrary constant
+    # so we never overshoot and risk wrapping or bouncing off grid edges.
+    _grid_rows = len(NAME_ENTRY_GRID)          # 4
+    _grid_cols = len(NAME_ENTRY_GRID[0])       # 9
+    queue.extend(["UP"] * (_grid_rows - 1))    # max 3 moves to reach row 0
+    queue.extend(["LEFT"] * (_grid_cols - 1))  # max 8 moves to reach col 0
+    for ch in (name or ""):
+        if ch not in positions:
+            continue
+        target_row, target_col = positions[ch]
+        while row < target_row:
+            queue.append("DOWN")
+            row += 1
+        while row > target_row:
+            queue.append("UP")
+            row -= 1
+        while col < target_col:
+            queue.append("RIGHT")
+            col += 1
+        while col > target_col:
+            queue.append("LEFT")
+            col -= 1
+        queue.append("A")
+
+    queue.extend(["START", "A"])
+    return queue
+
+
+def default_map_constants_path():
+    here = Path(__file__).resolve()
+    candidates = []
+    for parent in here.parents:
+        candidates.append(parent / "pokegold-src" / "constants" / "map_constants.asm")
+        candidates.append(parent / "constants" / "map_constants.asm")
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return ""
+
+
+def load_map_index(path: Path):
+    out = {}
+    if not path or not path.exists():
+        return out
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    group = 0
+    for line in lines:
+        s = line.strip()
+        if s.startswith("newgroup "):
+            group += 1
+            continue
+        m = re.match(r"map_const\s+([A-Z0-9_]+).*;\s*(\d+)$", s)
+        if not m:
+            continue
+        name = m.group(1)
+        number = int(m.group(2))
+        out[(group, number)] = name
+    return out
+
+
+def map_name_for_state(state, index):
+    return index.get(
+        (state["map_group"], state["map_number"]),
+        f"{state['map_group']}-{state['map_number']}",
+    )
+
+
+NUM_POKEMON = 251
+
+# --- Goal priority tiers (evaluated top-to-bottom) ---
+# The AI always pursues the highest-priority incomplete goal.
+
+def _goal_status(state):
+    """Return a dict summarising completion of every major goal."""
+    johto = int(state.get("badges_johto", 0)) & 0xFF
+    kanto = int(state.get("badges_kanto", 0)) & 0xFF
+    return {
+        "johto_badges": johto.bit_count(),
+        "kanto_badges": kanto.bit_count(),
+        "dex_caught": int(state.get("dex_caught", 0)),
+        "dex_seen": int(state.get("dex_seen", 0)),
+        "beat_elite_four": int(state.get("beat_elite_four", 0)),
+        "beat_red": int(state.get("beat_red", 0)),
+        "party_count": int(state.get("party_count", 0)),
+        "party_detail": state.get("party_detail", []),
+        "num_items": int(state.get("num_items", 0)),
+        "num_key_items": int(state.get("num_key_items", 0)),
+        "balls": int(state.get("balls", 0)),
+    }
+
+
+def story_objective(state, map_name):
+    g = _goal_status(state)
+    johto = g["johto_badges"]
+    kanto = g["kanto_badges"]
+    caught = g["dex_caught"]
+    balls = g["balls"]
+
+    # --- Tier 0: Intro / early game ---
+    if johto == 0:
+        if map_name in {"PLAYERS_HOUSE_2F", "PLAYERS_HOUSE_1F", "NEW_BARK_TOWN"}:
+            return "Early game: leave home, finish mom intro, reach Elm's Lab, get starter."
+        if map_name == "ELMS_LAB":
+            return "Early game: claim starter, run first rival trigger, begin Route 29 progression."
+        return (
+            "Early game: push intro, lock in starter path, start Johto route. "
+            "CATCH every new wild Pokemon you encounter, train your starter and team, "
+            "and pick up all items on the ground. Use breeding later when it becomes available."
+        )
+
+    # --- Tier 1: Johto gym campaign + catch everything along the way ---
+    if johto < 8:
+        catch_note = ""
+        if balls > 0:
+            catch_note = (
+                f" CATCH any wild Pokemon you haven't caught yet ({caught}/{NUM_POKEMON} owned), "
+                "train your team for the next gym, breed for new species when possible, and pick up all items."
+            )
+        return (
+            f"Johto campaign: defeat next Johto gym leader ({johto}/8 badges), "
+            f"advance Team Rocket + lighthouse + radio story gates.{catch_note}"
+        )
+
+    # --- Tier 2: Elite Four ---
+    if not g["beat_elite_four"]:
+        return (
+            f"League challenge: clear Victory Road and defeat the Elite Four + Champion Lance. "
+            f"Grind if your team is below level 40. Catch and train new Pokemon on the way ({caught}/{NUM_POKEMON}), "
+            f"and collect every item you can reach."
+        )
+
+    # --- Tier 3: Kanto gym circuit ---
+    if kanto < 8:
+        return (
+            f"Kanto campaign: defeat next Kanto gym leader ({kanto}/8 badges). "
+            f"Explore every route, catch every new species ({caught}/{NUM_POKEMON}), breed when useful, "
+            f"train your team, and collect all items."
+        )
+
+    # --- Tier 4: Beat Red ---
+    if not g["beat_red"]:
+        return (
+            f"Mt. Silver: climb to the summit and defeat Red. "
+            f"Grind your team to level 70+. Catch remaining Pokemon ({caught}/{NUM_POKEMON}), "
+            f"use breeding for remaining species, and keep collecting rare items. "
+            f"Collect all TMs, Rare Candies, and key items."
+        )
+
+    # --- Tier 5: Completionist mop-up ---
+    if caught < NUM_POKEMON:
+        return (
+            f"Completionist: catch remaining Pokemon ({caught}/{NUM_POKEMON}). "
+            f"Fish, Surf, use Headbutt trees, breed, train evolving lines, and explore every cave. "
+            f"Collect all remaining items."
+        )
+
+    return (
+        f"ALL GOALS COMPLETE! {caught}/{NUM_POKEMON} Pokemon caught, "
+        f"all 16 badges, Elite Four + Red defeated. "
+        f"Continue exploring and collecting any missed items."
+    )
+
+def objective_route_pattern(state, map_name):
+    """Broad walkthrough-derived movement bias when host sync is missing.
+
+    This is intentionally not tile-perfect. It gives the agent a deterministic
+    story-direction drift based on badge progress and current campaign phase,
+    which is still far better than random wandering when it loses the host.
+    """
+    johto = int(state.get("badges_johto", 0)) & 0xFF
+    kanto = int(state.get("badges_kanto", 0)) & 0xFF
+    johto_count = johto.bit_count()
+    kanto_count = kanto.bit_count()
+
+    name = (map_name or "").upper()
+
+    local_bias = [
+        (("SPROUT_TOWER",), ["UP", "A", "UP", "RIGHT", "A"]),
+        (("SLOWPOKE_WELL",), ["DOWN", "A", "LEFT", "A", "UP"]),
+        (("ILEX_FOREST",), ["RIGHT", "UP", "A", "RIGHT", "UP"]),
+        (("BURNED_TOWER",), ["UP", "A", "RIGHT", "UP", "A"]),
+        (("LIGHTHOUSE",), ["UP", "A", "LEFT", "UP", "A"]),
+        (("ROCKET_HIDEOUT", "RADIO_TOWER", "UNDERGROUND"), ["UP", "A", "RIGHT", "A", "LEFT"]),
+        (("ICE_PATH",), ["UP", "RIGHT", "UP", "LEFT", "A"]),
+        (("DRAGONS_DEN",), ["UP", "A", "RIGHT", "A", "UP"]),
+        (("VICTORY_ROAD",), ["UP", "RIGHT", "A", "UP", "LEFT"]),
+        (("ROCK_TUNNEL",), ["RIGHT", "UP", "A", "RIGHT", "UP"]),
+        (("SEAFOAM",), ["LEFT", "UP", "A", "LEFT", "UP"]),
+        (("MT_SILVER",), ["UP", "UP", "RIGHT", "A", "UP", "LEFT"]),
+    ]
+    for needles, pattern in local_bias:
+        if any(n in name for n in needles):
+            return pattern
+
+    if johto_count == 0:
+        return ["LEFT", "LEFT", "UP", "UP", "A", "LEFT", "UP"]
+    if johto_count == 1:
+        return ["DOWN", "DOWN", "LEFT", "LEFT", "A", "DOWN", "LEFT"]
+    if johto_count == 2:
+        return ["RIGHT", "RIGHT", "UP", "A", "RIGHT", "UP", "A"]
+    if johto_count == 3:
+        return ["UP", "RIGHT", "UP", "A", "LEFT", "UP", "A"]
+    if johto_count in {4, 5}:
+        return ["LEFT", "DOWN", "LEFT", "A", "UP", "LEFT", "A"]
+    if johto_count == 6:
+        return ["RIGHT", "UP", "RIGHT", "A", "UP", "RIGHT", "A"]
+    if johto_count == 7:
+        return ["RIGHT", "UP", "A", "UP", "LEFT", "UP", "A"]
+    if johto_count >= 8 and not int(state.get("beat_elite_four", 0)):
+        return ["DOWN", "RIGHT", "UP", "A", "RIGHT", "UP", "A"]
+    if kanto_count == 0:
+        return ["RIGHT", "UP", "A", "RIGHT", "UP", "A"]
+    if kanto_count == 1:
+        return ["UP", "RIGHT", "A", "UP", "LEFT", "UP", "A"]
+    if kanto_count == 2:
+        return ["RIGHT", "UP", "A", "LEFT", "UP", "A", "RIGHT"]
+    if kanto_count == 3:
+        return ["LEFT", "UP", "A", "LEFT", "DOWN", "LEFT", "A"]
+    if kanto_count == 4:
+        return ["LEFT", "DOWN", "A", "LEFT", "DOWN", "LEFT", "A"]
+    if kanto_count == 5:
+        return ["RIGHT", "RIGHT", "UP", "A", "RIGHT", "UP", "A"]
+    if kanto_count == 6:
+        return ["LEFT", "DOWN", "LEFT", "A", "LEFT", "UP", "A"]
+    if kanto_count == 7 and not int(state.get("beat_red", 0)):
+        return ["UP", "LEFT", "UP", "A", "UP", "RIGHT", "A"]
+    return ["UP", "RIGHT", "A", "LEFT", "UP", "A"]
+
+
+
+class Memory:
+    def __init__(self, path: Path):
+        self.path = path
+        self.q = {}
+        self.clone = {}
+        self.steps = 0
+        self.bad = []
+        self.load()
+
+    def load(self):
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self.q = data.get("q", {})
+            self.clone = data.get("clone", {})
+            self.steps = int(data.get("steps", 0))
+            self.bad = data.get("bad", [])[-30:]
+        except Exception:
+            pass
+
+    def save(self):
+        payload = {
+            "q": self.q,
+            "clone": self.clone,
+            "steps": self.steps,
+            "bad": self.bad[-30:],
+        }
+        self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def qvalue(self, state_key, action):
+        return float(self.q.get(state_key, {}).get(action, 0.0))
+
+    def clonevalue(self, state_key, action):
+        return float(self.clone.get(state_key, {}).get(action, 0.0))
+
+    def best_action(self, state_key, allowed, fallback):
+        row = self.q.get(state_key, {})
+        best = fallback
+        best_v = -10**9
+        for action in allowed:
+            v = float(row.get(action, 0.0))
+            if v > best_v:
+                best = action
+                best_v = v
+        return best
+
+    def update(self, prev_state, prev_action, reward, next_state, allowed_next):
+        alpha = 0.22
+        gamma = 0.88
+        row = self.q.setdefault(prev_state, {})
+        old = float(row.get(prev_action, 0.0))
+        next_best = 0.0
+        if allowed_next:
+            next_best = max(self.qvalue(next_state, a) for a in allowed_next)
+        new_v = old + alpha * (reward + gamma * next_best - old)
+        row[prev_action] = round(new_v, 6)
+        self.steps += 1
+        if reward <= -0.5:
+            self.bad.append(
+                {
+                    "t": int(time.time()),
+                    "state": prev_state,
+                    "action": prev_action,
+                    "reward": round(reward, 3),
+                }
+            )
+
+    def observe_teacher(self, state_key, action):
+        row = self.clone.setdefault(state_key, {})
+        row[action] = round(float(row.get(action, 0.0)) + 1.0, 3)
+        if len(row) > 10:
+            keep = sorted(row.items(), key=lambda kv: kv[1], reverse=True)[:6]
+            self.clone[state_key] = {k: v for k, v in keep}
+
+    def best_clone_action(self, state_key, allowed, fallback):
+        row = self.clone.get(state_key, {})
+        if not row:
+            return fallback
+        best = fallback
+        best_v = -10**9
+        for action in allowed:
+            v = float(row.get(action, 0.0))
+            if v > best_v:
+                best = action
+                best_v = v
+        return best
+
+
+class Ollama:
+    def __init__(self, model, url, timeout, knowledge_text="", walkthrough_text="", controls_text=""):
+        self.model = model
+        self.url = url.rstrip("/") + "/api/generate"
+        self.timeout = timeout
+        self.last_call = 0.0
+        self.cooldown_until = 0.0
+        self.knowledge_text = (knowledge_text or "").strip()
+        self.walkthrough_text = (walkthrough_text or "").strip()
+        self.controls_text = (controls_text or "").strip()
+
+    def choose(self, state, allowed, heuristic, q_best, clone_best, phase, objective, map_name, bad_examples, reward_state=None, progress_context=None, planner_context=None):
+        now = time.time()
+        if now < self.cooldown_until:
+            return None
+        if (now - self.last_call) < 0.9:
+            return None
+        self.last_call = now
+
+        bad = "; ".join(
+            f"{b.get('action')}->{b.get('reward')}" for b in bad_examples[-6:]
+        )
+        if not bad:
+            bad = "none"
+        reward_state = reward_state or {}
+        progress_context = progress_context or {}
+        planner_context = planner_context or {}
+        mood = str(reward_state.get("mood", "steady"))
+        cookies = float(reward_state.get("cookies_total", 0.0) or 0.0)
+        broccoli = float(reward_state.get("broccoli_total", 0.0) or 0.0)
+        broccoli_burn = float(reward_state.get("broccoli_burn_total", 0.0) or 0.0)
+        aligned = int(reward_state.get("guide_aligned", 0) or 0)
+        misaligned = int(reward_state.get("guide_misaligned", 0) or 0)
+        broccoli_dislike = float(reward_state.get("broccoli_dislike", 1.35) or 1.35)
+        broccoli_pressure = float(reward_state.get("broccoli_pressure", 0.0) or 0.0)
+        cookie_drive = float(reward_state.get("cookie_drive", 0.0) or 0.0)
+        net_reward_score = float(reward_state.get("net_reward_score", 0.0) or 0.0)
+        reward_recent_summary = str(reward_state.get("reward_recent_summary", "none") or "none")
+        reward_directive = str(reward_state.get("reward_directive", "STAY_DISCIPLINED") or "STAY_DISCIPLINED")
+        discipline_ratio = float(reward_state.get("discipline_ratio", 1.0) or 1.0)
+        prompt = (
+            "You ONLY control Pokemon Silver from telemetry and must output ONE action token.\n"
+            "Controls: A=confirm/talk, B=cancel, START=menu, UP/DOWN/LEFT/RIGHT=movement, *_A=move while confirming.\n"
+            "Priority rules: (1) follow host when same map, (2) battle/catch efficiently, (3) when host data is missing, obey the walkthrough control ladder and current story step instead of wandering.\n"
+            f"Current phase: {phase}.\n"
+            f"Current map: {map_name}. Objective: {objective}.\n"
+            + f"Reward mood: {mood}. Cookies={cookies:.2f}, Broccoli={broccoli:.2f}, BroccoliBurn={broccoli_burn:.2f}, BroccoliDislike={broccoli_dislike:.2f}, BroccoliPressure={broccoli_pressure:.2f}, CookieDrive={cookie_drive:.2f}, NetReward={net_reward_score:.2f}, GuideAligned={aligned}, GuideMisses={misaligned}.\n"
+            + f"Recent reward feedback: {reward_recent_summary}\n"
+            + f"Reward directive: {reward_directive} DisciplineRatio={discipline_ratio:.2f}.\n"
+            + "Read the reward scoreboard before acting. High broccoli pressure means avoid standing still, avoid NONE, avoid dead loops, and obey the guide or the best proven progress action. High cookie drive means push toward useful movement, interactions, battle progress, catches, items, and badge progress right now.\n"
+            + "The AI hates broccoli. Standing still, idling too long, stall loops, repeated dead-end tasks, or ignoring the guide causes broccoli and slams mood hard. Use the correct progress button quickly to break stalls and earn cookies instead.\n"
+            + "Cookies come from following the guide, reducing drift, and breaking stalls. Helpful progress also burns off a little stored broccoli. Broccoli comes from standing still, idling too long, stalling, repeating useless tasks, or ignoring the guide.\n"
+            + "Manual override demonstrations from the player are stored as teacher examples. When a similar state returns, respect the demonstrated action unless telemetry clearly says otherwise.\n"
+            f"Badge progress: Johto={int(state.get('badges_johto', 0)) & 0xFF}, Kanto={int(state.get('badges_kanto', 0)) & 0xFF}.\n"
+            "Pick ONE action token from this set only: "
+            + ", ".join(allowed)
+            + ".\n"
+            + f"Heuristic action: {heuristic}. Learned best action: {q_best}. Teacher/demo best: {clone_best}.\n"
+            + f"Recent mistakes: {bad}\n"
+            + ("Control mastery notes: " + self.controls_text + "\n" if self.controls_text else "")
+            + ("Guide notes: " + self.knowledge_text + "\n" if self.knowledge_text else "")
+            + ("Walkthrough notes: " + self.walkthrough_text + "\n" if self.walkthrough_text else "")
+            + ("Progress context: " + json.dumps(progress_context, separators=(",", ":")) + "\n" if progress_context else "")
+            + ("Planner context: " + json.dumps(planner_context, separators=(",", ":")) + "\n" if planner_context else "")
+            + "State: "
+            + json.dumps(state, separators=(",", ":"))
+            + "\nReturn only the action token."
+        )
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.15, "num_predict": 12},
+        }
+        req = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+            raw = (data.get("response") or "").strip().upper().replace(" ", "_")
+            token = raw.splitlines()[0].split("`")[0].strip(" .,:;")
+            if token in allowed:
+                return token
+            for action in allowed:
+                if action in raw:
+                    return action
+            return None
+        except Exception:
+            self.cooldown_until = time.time() + 2.5
+            return None
+
+
+def _parse_party_detail(raw):
+    """Parse 'sp:lv:hp:mhp,sp:lv:hp:mhp,...' into list of dicts."""
+    if not raw or raw == "0":
+        return []
+    party = []
+    for entry in raw.split(","):
+        parts = entry.split(":")
+        if len(parts) == 4:
+            try:
+                party.append({
+                    "species": int(parts[0]),
+                    "level": int(parts[1]),
+                    "hp": int(parts[2]),
+                    "max_hp": int(parts[3]),
+                })
+            except ValueError:
+                pass
+    return party
+
+
+def parse_state(line):
+    parts = line.strip().split("|")
+    if parts[0] != "S":
+        return None
+    # First 37 fields (indices 1-37) are integers; field 42 (index 42) is party string.
+    # Parse integers first, handle party string separately.
+    raw = parts[1:]
+    if len(raw) < 21:
+        return None
+
+    def intval(idx, fallback=0):
+        if idx < len(raw):
+            try:
+                return int(raw[idx])
+            except ValueError:
+                return fallback
+        return fallback
+
+    def strval(idx, fallback=""):
+        if idx < len(raw):
+            return raw[idx]
+        return fallback
+
+    return {
+        "frame": intval(0),
+        "map_group": intval(1),
+        "map_number": intval(2),
+        "x": intval(3),
+        "y": intval(4),
+        "host_map_group": intval(5),
+        "host_map_number": intval(6),
+        "host_x": intval(7),
+        "host_y": intval(8),
+        "battle_mode": intval(9),
+        "battle_type": intval(10),
+        "in_menu": intval(11),
+        "script_running": intval(12),
+        "menu_y": intval(13),
+        "menu_x": intval(14),
+        "party_count": intval(15),
+        "balls": intval(16),
+        "enemy_hp": intval(17),
+        "enemy_species": intval(18),
+        "battle_menu_pos": intval(19),
+        "joypad_disable": intval(20),
+        "naming_type": intval(21),
+        "menu_items": intval(22),
+        "menu_top": intval(23),
+        "menu_left": intval(24),
+        "menu_bottom": intval(25),
+        "menu_right": intval(26),
+        "map_status": intval(27),
+        "house_scene": intval(28),
+        "script_bank": intval(29),
+        "script_pos": intval(30),
+        "badges_johto": intval(31),
+        "badges_kanto": intval(32),
+        "bridge_ai_ttl": intval(33),
+        "bridge_ai_keys": intval(34),
+        "raw_keys": intval(35),
+        "keys_read_count": intval(36),
+        # Extended telemetry
+        "dex_caught": intval(37),
+        "dex_seen": intval(38),
+        "num_items": intval(39),
+        "num_key_items": intval(40),
+        "party_detail": _parse_party_detail(strval(41)),
+        "beat_elite_four": intval(42),
+        "beat_red": intval(43),
+    }
+
+
+def same_map(state):
+    return (
+        host_sync_available(state)
+        and state["host_map_group"] == state["map_group"]
+        and state["host_map_number"] == state["map_number"]
+    )
+
+
+def host_follow_ready(state):
+    if not same_map(state):
+        return False
+    if state["host_x"] < 0 or state["host_y"] < 0:
+        return False
+    if state["battle_mode"] != 0:
+        return False
+    if state["in_menu"] != 0:
+        return False
+    if state["script_running"] != 0:
+        return False
+    if state["joypad_disable"] != 0:
+        return False
+    if state["map_status"] < 2:
+        return False
+    return True
+
+
+def is_name_choice_menu(state):
+    if state["menu_items"] != NAME_MENU_ITEMS:
+        return False
+    if state["map_group"] != 0 or state["map_number"] != 0 or state["map_status"] != 0:
+        return False
+    if state["naming_type"] not in (0, 1):
+        return False
+    # Cursor box can drift by a pixel/row depending on dialog transition timing;
+    # accept a small window around the expected NEW NAME menu rectangle.
+    if state["menu_top"] > (NAME_MENU_TOP + 2):
+        return False
+    if state["menu_left"] > (NAME_MENU_LEFT + 2):
+        return False
+    if state["menu_bottom"] < 9 or state["menu_bottom"] > (NAME_MENU_BOTTOM + 3):
+        return False
+    if state["menu_right"] < (NAME_MENU_RIGHT - 2) or state["menu_right"] > (NAME_MENU_RIGHT + 4):
+        return False
+    return True
+
+
+def is_continue_menu_candidate(state):
+    if state["battle_mode"] != 0:
+        return False
+    if state["map_group"] != 0 or state["map_number"] != 0:
+        return False
+    if state["map_status"] != 0:
+        return False
+    if state["script_running"] != 0:
+        return False
+    items = state["menu_items"]
+    if items < CONTINUE_MENU_MIN_ITEMS or items > CONTINUE_MENU_MAX_ITEMS:
+        return False
+    if is_name_choice_menu(state):
+        return False
+    # Title/continue menu in GSC often reports in_menu=0 in this state.
+    if state["menu_top"] > state["menu_bottom"] or state["menu_left"] > state["menu_right"]:
+        return False
+    if (state["menu_bottom"] - state["menu_top"]) < 2:
+        return False
+    if (state["menu_right"] - state["menu_left"]) < 4:
+        return False
+    # Some builds report in_menu=0 on the continue menu.
+    # Accept both common box layouts: bottom-right and top-left anchored.
+    if items <= 2 and state["in_menu"] == 0:
+        plausible_box = (
+            state["menu_bottom"] >= 4
+            and state["menu_right"] >= 10
+        )
+        if not plausible_box:
+            return False
+    return True
+
+
+def likely_naming_screen(state):
+    if state["map_group"] != 0 or state["map_number"] != 0 or state["map_status"] != 0:
+        return False
+    if state["naming_type"] == 0:
+        return False
+    if is_name_choice_menu(state):
+        return False
+    if is_continue_menu_candidate(state):
+        return False
+    if (
+        state["menu_top"] <= 2
+        and state["menu_left"] <= 2
+        and state["menu_bottom"] >= 8
+        and state["menu_right"] >= 8
+    ):
+        return True
+    if state["menu_items"] <= 1 and state["in_menu"] == 0:
+        return True
+    return False
+
+
+def likely_boot_shell(state):
+    if state["battle_mode"] != 0:
+        return False
+    if state["map_group"] != 0 or state["map_number"] != 0:
+        return False
+    if host_sync_available(state):
+        return False
+    if state["party_count"] > 1:
+        return False
+    if state["script_running"] not in (0, 1):
+        return False
+    if state["in_menu"] != 0:
+        return True
+    if state["map_status"] in (0, 255):
+        return True
+    return False
+
+
+def on_home_intro_map(state):
+    return state["map_group"] == 24 and state["map_number"] in (6, 7)
+
+
+def opposite_move(action):
+    table = {
+        "UP": "DOWN",
+        "DOWN": "UP",
+        "LEFT": "RIGHT",
+        "RIGHT": "LEFT",
+        "UP_A": "DOWN_A",
+        "DOWN_A": "UP_A",
+        "LEFT_A": "RIGHT_A",
+        "RIGHT_A": "LEFT_A",
+    }
+    return table.get(action, action)
+
+
+def normalize_menu_pos(raw):
+    # GSC menu cursors are sometimes 0..3, sometimes 1..4.
+    if 0 <= raw <= 3:
+        return raw
+    if 1 <= raw <= 4:
+        return raw - 1
+    return -1
+
+
+def nav_2x2(current, target):
+    if current < 0:
+        return "A"
+    cur_row = 1 if current >= 2 else 0
+    cur_col = 1 if (current % 2) == 1 else 0
+    tgt_row = 1 if target >= 2 else 0
+    tgt_col = 1 if (target % 2) == 1 else 0
+    if cur_row < tgt_row:
+        return "DOWN"
+    if cur_row > tgt_row:
+        return "UP"
+    if cur_col < tgt_col:
+        return "RIGHT"
+    if cur_col > tgt_col:
+        return "LEFT"
+    return "A"
+
+
+def movement_pair(dx, dy, last_action):
+    horizontal = None
+    vertical = None
+    if dx > 0:
+        horizontal = "RIGHT"
+    elif dx < 0:
+        horizontal = "LEFT"
+    if dy > 0:
+        vertical = "DOWN"
+    elif dy < 0:
+        vertical = "UP"
+
+    if horizontal and not vertical:
+        return horizontal, None
+    if vertical and not horizontal:
+        return vertical, None
+    if not horizontal and not vertical:
+        return "NONE", None
+
+    if abs(dx) > abs(dy):
+        return horizontal, vertical
+    if abs(dy) > abs(dx):
+        return vertical, horizontal
+
+    if last_action in HORIZONTAL_ACTIONS:
+        return horizontal, vertical
+    if last_action in VERTICAL_ACTIONS:
+        return vertical, horizontal
+    return horizontal, vertical
+
+
+def _is_species_caught(state, species_id):
+    """Check if the enemy species is already in our party (rough proxy for caught).
+
+    We can't read the full pokedex bitfield per-frame from the state line,
+    but we CAN check if dex_caught went up on the next transition.
+    For now, check if the species already appears in our party.
+    """
+    for mon in state.get("party_detail", []):
+        if mon.get("species", 0) == species_id:
+            return True
+    return False
+
+
+def battle_heuristic(state):
+    if state["joypad_disable"] != 0:
+        return "NONE"
+    if state["script_running"] != 0:
+        return "A"
+    if state["in_menu"] == 0:
+        return "A"
+
+    menu_pos = normalize_menu_pos(state["battle_menu_pos"])
+    enemy_hp = max(0, state["enemy_hp"])
+    enemy_species = int(state.get("enemy_species", 0))
+    balls = max(0, state["balls"])
+    wild_battle = state["battle_type"] == 1
+
+    # CATCHING PRIORITY: Try to catch any wild Pokemon, especially if
+    # we don't already have its species in our party.
+    # - Always try to catch at low HP (any species).
+    # - At higher HP, weaken first then catch.
+    already_have = _is_species_caught(state, enemy_species) if enemy_species > 0 else True
+    want_catch = wild_battle and balls > 0 and enemy_hp > 0
+
+    if want_catch:
+        if enemy_hp <= 50 or (not already_have and enemy_hp <= 120):
+            # HP low enough — go to PACK to throw a ball.
+            return nav_2x2(menu_pos, 2)
+        # HP still high — FIGHT to weaken it first.
+        return nav_2x2(menu_pos, 0)
+
+    # Trainer battle or no balls: bias to FIGHT (top-left).
+    return nav_2x2(menu_pos, 0)
+
+
+def follow_heuristic(state, stuck_count, last_action):
+    if state["joypad_disable"] != 0:
+        return "NONE"
+    if state["script_running"] != 0:
+        return "A"
+    if state["in_menu"] != 0:
+        return "A"
+    if not same_map(state):
+        return "NONE"
+
+    dx = state["host_x"] - state["x"]
+    dy = state["host_y"] - state["y"]
+    dist = abs(dx) + abs(dy)
+    if dist == 0:
+        return "NONE"
+
+    primary, secondary = movement_pair(dx, dy, last_action)
+    if dist <= 1:
+        if (state["frame"] % 20) == 0:
+            return "A"
+        return primary
+
+    if stuck_count >= 10:
+        pattern = []
+        if secondary:
+            pattern.append(secondary)
+        pattern.extend([opposite_move(primary), "A", primary])
+        idx = (state["frame"] // 6) % max(1, len(pattern))
+        return pattern[idx]
+
+    if dist >= 7:
+        return primary
+    if dist >= 3:
+        if secondary and (state["frame"] % 13) == 0:
+            return secondary
+        return primary
+
+    if (state["frame"] % 5) == 0:
+        return "A"
+    return primary
+
+
+def walkthrough_fallback_action(state, map_name, last_action, stuck_count, intro_stall_frames):
+    if state["joypad_disable"] != 0:
+        return "NONE"
+    if state["script_running"] != 0 or state["in_menu"] != 0:
+        return "A"
+    if map_name == "PLAYERS_HOUSE_2F" and state["house_scene"] == 0 and state["party_count"] == 0:
+        # The wake-up script sometimes reports clear input before movement
+        # truly unlocks. Tap A briefly, then force deterministic movement.
+        if intro_stall_frames < 72:
+            if pulse(state["frame"], 4, 2):
+                return "A"
+            return "NONE"
+        if intro_stall_frames < 140 and pulse(state["frame"], 16, 1, 0):
+            return "A"
+
+    # Deterministic early-game route when host sync is missing:
+    # bedroom stairs -> first floor exit -> Elm's Lab.
+    target = None
+    if map_name == "PLAYERS_HOUSE_2F":
+        # Bedroom spawn can trap movement if we path directly to stairs.
+        # Route through a clear interior tile first, then line up with stairs.
+        if state["x"] <= 1 and state["y"] >= 3:
+            target = (2, 2)
+        elif state["x"] < 7 and state["y"] >= 2:
+            target = (7, 2)
+        else:
+            target = (7, 1)
+    elif map_name == "PLAYERS_HOUSE_1F":
+        # Leaving stairs on 1F needs a short horizontal step before
+        # moving downward into the mom-intro trigger lane.
+        if stuck_count >= 80 and 7 <= state["x"] <= 9 and 3 <= state["y"] <= 4:
+            # If we wedge near mom's trigger lane, explicitly face/talk first.
+            mom_recover = ["UP", "A", "A", "DOWN", "LEFT", "DOWN"]
+            return mom_recover[(state["frame"] // 4) % len(mom_recover)]
+        if state["y"] <= 1:
+            target = (8, 1)
+        elif state["y"] < 4:
+            target = (9, 4)
+        else:
+            target = (6, 7)
+    else:
+        route_targets = {
+            "NEW_BARK_TOWN": (6, 3),
+        }
+        target = route_targets.get(map_name)
+
+    if target is not None:
+        tx, ty = target
+        dx = tx - state["x"]
+        dy = ty - state["y"]
+        dist = abs(dx) + abs(dy)
+        if map_name == "PLAYERS_HOUSE_2F" and intro_stall_frames >= 180 and stuck_count >= 8:
+            recover2f = ["UP", "LEFT", "UP", "RIGHT", "UP", "A", "UP"]
+            return recover2f[(state["frame"] // 4) % len(recover2f)]
+        if stuck_count >= 10:
+            recovery = ["DOWN", "RIGHT", "UP", "RIGHT", "LEFT", "DOWN", "RIGHT", "UP"]
+            if map_name == "PLAYERS_HOUSE_1F":
+                recovery = ["LEFT", "DOWN", "LEFT", "DOWN", "RIGHT", "DOWN", "LEFT"]
+            return recovery[(state["frame"] // 4) % len(recovery)]
+        if dist == 0:
+            # Nudge into warp tile direction when standing exactly on it.
+            warp_dir = "UP"
+            if map_name in {"PLAYERS_HOUSE_2F", "PLAYERS_HOUSE_1F"}:
+                warp_dir = "DOWN"
+            if pulse(state["frame"], 6, 1):
+                return warp_dir
+            return "NONE"
+        primary, secondary = movement_pair(dx, dy, last_action)
+        if stuck_count >= 12 and secondary:
+            if pulse(state["frame"], 4, 2):
+                return secondary
+        return primary
+
+    # Deterministic walkthrough-derived exploration sequence for story progression
+    # when host sync is unavailable. This biases the agent along the main game
+    # route order instead of letting it wander randomly.
+    pattern = objective_route_pattern(state, map_name)
+    if stuck_count >= 12:
+        pattern = list(pattern) + ["A"]
+    action = pattern[(state["frame"] // 8) % max(1, len(pattern))]
+
+    if (
+        last_action in MOVEMENT_ACTIONS
+        and action in MOVEMENT_ACTIONS
+        and opposite_move(action) == last_action
+    ):
+        return last_action
+    return action
+
+
+def boot_recovery_action(state):
+    # Safety net for title/start menus and blocked boot flow.
+    frame = state["frame"]
+    if state["battle_mode"] != 0:
+        return None
+    boot_map = is_boot_map(state)
+    if not (likely_boot_shell(state) or boot_map):
+        return None
+
+    if state["in_menu"] != 0:
+        items = state["menu_items"]
+        if CONTINUE_MENU_MIN_ITEMS <= items <= CONTINUE_MENU_MAX_ITEMS:
+            if pulse(frame, 8, 1, 0):
+                return "UP"
+            if pulse(frame, 8, 2, 2):
+                return "A"
+            return "NONE"
+        if pulse(frame, 4, 2):
+            return "A"
+        return "NONE"
+    if is_continue_menu_candidate(state):
+        if pulse(frame, 12, 2, 0):
+            return "START"
+        if pulse(frame, 12, 2, 4):
+            return "A"
+        return "NONE"
+    if boot_map:
+        if pulse(frame, 8, 1, 0):
+            return "START"
+        if pulse(frame, 4, 2, 1):
+            return "A"
+        return "NONE"
+    return None
+
+
+class IntroDirector:
+    def __init__(self, model_name: str, name_slot: int):
+        if name_slot > 0:
+            self.name_slot = clamp(name_slot, 1, 4)
+        else:
+            h = sum(ord(c) for c in model_name)
+            self.name_slot = (h % 4) + 1
+        self.queue = []
+        self.name_selected = False
+        self.agent_name = derive_agent_name(model_name)
+        self.awaiting_name_entry = False
+        self.await_name_deadline = -1
+        self.name_entry_complete = False
+        self.naming_homed = False
+        self.boot_progress_latched = False
+        self.last_phase = ""
+        self.phase_started = -1
+
+    def clear_name_flow(self):
+        self.awaiting_name_entry = False
+        self.await_name_deadline = -1
+        self.name_entry_complete = False
+        self.naming_homed = False
+        self.queue = []
+
+    def phase_age(self, phase, state):
+        if phase != self.last_phase:
+            self.last_phase = phase
+            self.phase_started = state["frame"]
+        if self.phase_started < 0:
+            self.phase_started = state["frame"]
+        return max(0, state["frame"] - self.phase_started)
+
+    def phase(self, state):
+        if state["map_group"] != 0 or state["map_number"] != 0 or state["map_status"] >= 2:
+            self.boot_progress_latched = False
+        if (
+            state["map_group"] == 0
+            and state["map_number"] == 0
+            and state["map_status"] == 0
+            and state["party_count"] == 0
+            and (state["in_menu"] != 0 or state["script_running"] != 0 or state["naming_type"] != 0)
+        ):
+            self.boot_progress_latched = True
+        if state["battle_mode"] != 0:
+            return "BATTLE"
+        if is_name_choice_menu(state):
+            return "NAME_CHOICE"
+        if likely_naming_screen(state) and (self.awaiting_name_entry or state["naming_type"] != 0):
+            return "NAMING_SCREEN"
+        if is_continue_menu_candidate(state):
+            # Hidden continue telemetry can persist into Oak scenes; once intro
+            # progression is latched, ignore in_menu=0 continue signatures.
+            if self.boot_progress_latched and state["in_menu"] == 0:
+                pass
+            else:
+                return "CONTINUE_MENU"
+        if (
+            self.boot_progress_latched
+            and state["map_group"] == 0
+            and state["map_number"] == 0
+            and state["map_status"] == 0
+        ):
+            return "OAK_INTRO"
+        if is_continue_menu_candidate(state):
+            return "CONTINUE_MENU"
+        if (
+            state["map_group"] == 0
+            and state["map_number"] == 0
+            and state["map_status"] == 0
+            and state["in_menu"] == 0
+            and state["script_running"] == 0
+        ):
+            return "TITLE"
+        if state["map_group"] == 0 and state["map_number"] == 0 and state["map_status"] == 0:
+            return "OAK_INTRO"
+        if on_home_intro_map(state) and state["party_count"] == 0 and state["house_scene"] == 0:
+            return "MOM_INTRO"
+        # Any loaded, non-boot map should be navigated as overworld.
+        if state["map_group"] != 0 or state["map_number"] != 0:
+            return "OVERWORLD"
+        # When map is fully loaded and input is free, treat as overworld (follow can run),
+        # even if intro flags are still zero.
+        if (
+            state["map_status"] >= 2
+            and state["in_menu"] == 0
+            and state["joypad_disable"] == 0
+        ):
+            return "OVERWORLD"
+        return "OVERWORLD"
+
+    def decide(self, state):
+        if self.awaiting_name_entry and self.await_name_deadline > 0 and state["frame"] > self.await_name_deadline:
+            self.clear_name_flow()
+        if self.awaiting_name_entry and (
+            state["map_group"] != 0 or state["map_number"] != 0 or state["map_status"] >= 2
+        ):
+            self.clear_name_flow()
+
+        phase = self.phase(state)
+        phase_age = self.phase_age(phase, state)
+        if phase == "NAMING_SCREEN":
+            if not self.name_entry_complete:
+                if not self.naming_homed:
+                    # Normalize cursor to top-left before typing so the fixed
+                    # path for OLLAMA remains stable across menu variants.
+                    if phase_age < 72:
+                        if pulse(state["frame"], 6, 2, 0):
+                            return "UP"
+                        if pulse(state["frame"], 6, 2, 3):
+                            return "LEFT"
+                        return "NONE"
+                    self.naming_homed = True
+                if not self.queue:
+                    self.queue = build_name_entry_queue(self.agent_name)
+                if not self.queue:
+                    self.name_entry_complete = True
+                    return "NONE"
+                if not pulse(state["frame"], 4, 1):
+                    return "NONE"
+                action = self.queue.pop(0)
+                if not self.queue:
+                    self.name_entry_complete = True
+                return action
+            # Keep trying END/confirm if a script box interrupted the first attempt.
+            if pulse(state["frame"], 4, 1, 0):
+                return "START"
+            if pulse(state["frame"], 4, 1, 2):
+                return "A"
+            return "NONE"
+        if phase == "TITLE":
+            # Strong boot routine: some title states ignore A until START is pulsed.
+            if pulse(state["frame"], 10, 2, 0):
+                return "START"
+            if pulse(state["frame"], 4, 2, 1):
+                return "A"
+            if phase_age > 240 and pulse(state["frame"], 20, 1, 8):
+                return "DOWN"
+            return "NONE"
+        if phase == "CONTINUE_MENU":
+            # Before a run is named, bias to NEW GAME so we can hit name entry.
+            needs_new_game = (
+                not self.name_entry_complete
+                and not self.name_selected
+                and state["party_count"] == 0
+            )
+            hidden_menu = state["in_menu"] == 0
+            if needs_new_game:
+                if hidden_menu:
+                    if pulse(state["frame"], 12, 2, 0):
+                        return "START"
+                    if pulse(state["frame"], 12, 2, 4):
+                        return "A"
+                    if phase_age > 220 and pulse(state["frame"], 24, 1, 10):
+                        return "DOWN"
+                    if phase_age > 220 and pulse(state["frame"], 24, 1, 14):
+                        return "A"
+                    return "NONE"
+                # First force cursor upward (NEW GAME), then confirm.
+                if phase_age < 36:
+                    if pulse(state["frame"], 6, 2):
+                        return "UP"
+                    return "NONE"
+                # Prefer a deterministic UP+A rhythm. Some menu states ignore B.
+                if pulse(state["frame"], 12, 2, 0):
+                    return "UP"
+                if pulse(state["frame"], 12, 2, 4):
+                    return "A"
+                # Long-stall fallback: briefly sweep DOWN then confirm once.
+                if phase_age > 220 and pulse(state["frame"], 24, 1, 10):
+                    return "DOWN"
+                if phase_age > 220 and pulse(state["frame"], 24, 1, 14):
+                    return "A"
+                return "NONE"
+            # Otherwise bias to the top entry (continue).
+            if hidden_menu:
+                if pulse(state["frame"], 12, 2, 0):
+                    return "START"
+                if pulse(state["frame"], 12, 2, 4):
+                    return "A"
+                return "NONE"
+            if pulse(state["frame"], 8, 1, 0):
+                return "UP"
+            if pulse(state["frame"], 8, 2, 2):
+                return "A"
+            return "NONE"
+        if phase == "NAME_CHOICE":
+            if phase_age < 32:
+                if pulse(state["frame"], 4, 2):
+                    return "UP"
+                return "NONE"
+            # Telemetry cursor is often 1-based in this menu: treat 0/1 as top.
+            if state["menu_y"] > 1:
+                if pulse(state["frame"], 4, 2):
+                    return "UP"
+                return "NONE"
+            # If selection does not open after repeated confirms, sweep one slot
+            # down/up and retry to handle cursor indexing variants.
+            if phase_age > 180:
+                if pulse(state["frame"], 16, 1, 0):
+                    return "DOWN"
+                if pulse(state["frame"], 16, 1, 4):
+                    return "A"
+                if pulse(state["frame"], 16, 1, 8):
+                    return "UP"
+                if pulse(state["frame"], 16, 1, 12):
+                    return "A"
+                return "NONE"
+            if phase_age < 120 and pulse(state["frame"], 6, 2, 0):
+                return "UP"
+            if pulse(state["frame"], 4, 2, 1):
+                self.name_selected = True
+                self.awaiting_name_entry = True
+                self.await_name_deadline = state["frame"] + 1200
+                self.name_entry_complete = False
+                self.naming_homed = False
+                self.queue = []
+                return "A"
+            return "NONE"
+        if phase in ("OAK_INTRO", "MOM_INTRO"):
+            if phase == "OAK_INTRO" and is_continue_menu_candidate(state):
+                # Some title/continue screens are mis-labeled as OAK_INTRO when
+                # boot progression has been latched. Always prioritize START/A
+                # in that state so we do not drift into movement loops.
+                if pulse(state["frame"], 12, 2, 0):
+                    return "START"
+                if pulse(state["frame"], 12, 2, 4):
+                    return "A"
+                return "NONE"
+            if phase == "MOM_INTRO" and host_follow_ready(state):
+                return None
+            if (
+                phase == "MOM_INTRO"
+                and state["map_group"] == 24
+                and state["map_number"] == 7
+                and state["party_count"] == 0
+                and state["script_running"] == 0
+                and state["in_menu"] == 0
+                and state["y"] <= 1
+            ):
+                if pulse(state["frame"], 6, 2):
+                    return "DOWN"
+                return "NONE"
+            if state["in_menu"] != 0:
+                if pulse(state["frame"], 3, 2):
+                    return "A"
+                return "NONE"
+            if state["script_running"] != 0:
+                if pulse(state["frame"], 3, 2):
+                    return "A"
+                return "NONE"
+            if (
+                phase == "MOM_INTRO"
+                and state["map_group"] == 24
+                and state["map_number"] in (6, 7)
+                and state["party_count"] == 0
+            ):
+                # Let movement fallback route out of home once script/menu locks clear.
+                return None
+            if pulse(state["frame"], 6, 1):
+                return "A"
+            return "NONE"
+        return None
+
+
+def state_key(state):
+    if state["battle_mode"] == 0:
+        if (
+            state["naming_type"] != 0
+            and state["map_group"] == 0
+            and state["map_number"] == 0
+            and state["menu_bottom"] >= 14
+        ):
+            return f"NM:{state['menu_y']}:{state['menu_x']}:{state['script_running']}"
+        if is_name_choice_menu(state):
+            return f"NC:{state['menu_y']}:{state['menu_x']}:{state['script_running']}"
+        if state["map_status"] == 0:
+            return f"IN:{state['in_menu']}:{state['script_running']}:{state['menu_y']}:{state['menu_x']}"
+        if same_map(state):
+            dx = clamp(state["host_x"] - state["x"], -6, 6)
+            dy = clamp(state["host_y"] - state["y"], -6, 6)
+            return f"OW:1:{dx}:{dy}:{state['script_running']}:{state['in_menu']}:{state['house_scene']}"
+        return f"OW:0:{state['script_running']}:{state['in_menu']}:{state['house_scene']}"
+    hp_bucket = clamp(state["enemy_hp"] // 15, 0, 15)
+    return (
+        f"BT:{state['battle_mode']}:{state['battle_type']}:{state['in_menu']}:"
+        f"{state['menu_y']}:{state['menu_x']}:{state['balls'] > 0}:{hp_bucket}"
+    )
+
+
+def allowed_actions(state, intro_action):
+    if intro_action is not None:
+        return INTRO_ACTIONS
+    if state["battle_mode"] != 0:
+        return BATTLE_ACTIONS
+    return OVERWORLD_ACTIONS
+
+
+def heuristic_action(state, intro_action, stuck_count, last_action):
+    if intro_action is not None:
+        return intro_action
+
+    if state["battle_mode"] != 0:
+        return battle_heuristic(state)
+
+    return follow_heuristic(state, stuck_count, last_action)
+
+
+def reward_for_transition(prev, curr, prev_action):
+    reward = 0.0
+    if prev["battle_mode"] == 0 and curr["battle_mode"] != 0:
+        reward += 0.2
+    if prev["battle_mode"] == 0 and curr["battle_mode"] == 0 and same_map(prev) and same_map(curr):
+        prev_dist = abs(prev["host_x"] - prev["x"]) + abs(prev["host_y"] - prev["y"])
+        curr_dist = abs(curr["host_x"] - curr["x"]) + abs(curr["host_y"] - curr["y"])
+        if curr_dist < prev_dist:
+            reward += 0.8
+        elif curr_dist > prev_dist:
+            reward -= 0.8
+        if prev_action in MOVEMENT_ACTIONS and prev["x"] == curr["x"] and prev["y"] == curr["y"]:
+            reward -= 0.35
+    if curr["party_count"] > prev["party_count"]:
+        reward += 5.0
+    if prev["battle_mode"] != 0 and curr["battle_mode"] == 0 and curr["party_count"] == prev["party_count"]:
+        reward += 0.4
+    if curr["joypad_disable"] != 0:
+        reward -= 0.1
+    if prev["enemy_hp"] > curr["enemy_hp"] and curr["battle_mode"] != 0:
+        reward += 0.3
+    if curr["naming_type"] == 0 and prev["naming_type"] != 0:
+        reward += 1.5
+    if prev["map_status"] == 0 and curr["map_status"] != 0:
+        reward += 1.2
+    if prev["house_scene"] == 0 and curr["house_scene"] != 0:
+        reward += 1.2
+    return reward
+
+def guide_action_for_state(
+    state,
+    map_name,
+    intro_action,
+    phase,
+    stuck_count,
+    intro_stall_frames,
+    desync_frames,
+    last_action,
+    action_history,
+):
+    follow_priority = host_follow_ready(state)
+    boot_action = boot_recovery_action(state)
+    continue_like_boot = (
+        state["map_group"] == 0
+        and state["map_number"] == 0
+        and state["map_status"] == 0
+        and is_continue_menu_candidate(state)
+    )
+    if boot_action is not None and (intro_action is None or continue_like_boot):
+        return boot_action
+
+    planned_intro = intro_action
+    if planned_intro is not None:
+        if follow_priority:
+            planned_intro = None
+        stalled_intro = (
+            phase in ("OAK_INTRO", "MOM_INTRO")
+            and intro_stall_frames >= 180
+            and state["script_running"] == 0
+            and state["in_menu"] == 0
+        )
+        if planned_intro is not None and not stalled_intro:
+            return planned_intro
+        # Stalled OAK/MOM_INTRO: boot recovery must outrank random walkthrough so
+        # the agent keeps pressing START/A on the continue screen instead of
+        # wandering with movement keys when boot_progress_latched suppressed
+        # CONTINUE_MENU phase detection.
+        if stalled_intro and boot_action is not None:
+            return boot_action
+
+    if state["battle_mode"] == 0:
+        follow_action = follow_heuristic(state, stuck_count, last_action)
+        if same_map(state):
+            return smooth_candidate(state, follow_action, last_action, action_history)
+        if desync_frames < 36:
+            return smooth_candidate(state, "NONE", last_action, action_history)
+        fallback = walkthrough_fallback_action(
+            state, map_name, last_action, stuck_count, intro_stall_frames
+        )
+        return smooth_candidate(state, fallback, last_action, action_history)
+
+    return battle_heuristic(state)
+
+
+
+def teacher_action(prev, curr):
+    if prev["battle_mode"] != 0 or curr["battle_mode"] != 0:
+        return None
+    if prev["host_map_group"] < 0:
+        return None
+    if prev["host_map_group"] != curr["host_map_group"] or prev["host_map_number"] != curr["host_map_number"]:
+        return None
+    dx = curr["host_x"] - prev["host_x"]
+    dy = curr["host_y"] - prev["host_y"]
+    if dx == 0 and dy == 0:
+        return None
+    if abs(dx) >= abs(dy):
+        return "RIGHT" if dx > 0 else "LEFT"
+    return "DOWN" if dy > 0 else "UP"
+
+
+def smooth_candidate(state, candidate, last_action, action_history):
+    if candidate not in MOVEMENT_ACTIONS:
+        return candidate
+
+    if last_action in MOVEMENT_ACTIONS and opposite_move(candidate) == last_action:
+        if len(action_history) >= 3:
+            tail = list(action_history)[-3:]
+            if all(a in MOVEMENT_ACTIONS for a in tail):
+                # Avoid visible jitter between opposite directions — but only if the
+                # recent history shows variety (true jitter).  If all recent actions
+                # are the *same* direction we are stuck against a wall; forcing
+                # last_action again would keep hammering the same wall indefinitely,
+                # preventing recovery from breaking through.
+                if len(set(tail)) > 1:
+                    return last_action
+
+    if same_map(state):
+        dx = state["host_x"] - state["x"]
+        dy = state["host_y"] - state["y"]
+        dist = abs(dx) + abs(dy)
+        if dist >= 4 and last_action in MOVEMENT_ACTIONS and candidate != last_action:
+            if (state["frame"] % 2) == 0:
+                # Don't repeat a stuck action.  If the last 3 actions are all the
+                # same direction the AI is probably bumping a wall — let the new
+                # candidate through so recovery/wall-avoidance can steer around it.
+                tail = list(action_history)[-3:] if len(action_history) >= 3 else list(action_history)
+                if len(tail) < 3 or len(set(tail)) > 1:
+                    return last_action
+    return candidate
+
+
+def pick_action(
+    state,
+    map_name,
+    objective,
+    memory,
+    smart_policy,
+    meta_policy,
+    wall_avoidance,
+    ollama,
+    intro_action,
+    phase,
+    stuck_count,
+    intro_stall_frames,
+    desync_frames,
+    last_action,
+    action_history,
+    repeated_action_streak=0,
+    guide_action=None,
+    progress_snapshot=None,
+    planner_packet=None,
+    recovery_action=None,
+    mission_packet=None,
+    battle_packet=None,
+    capture_packet=None,
+):
+    follow_priority = host_follow_ready(state)
+    boot_action = boot_recovery_action(state)
+    continue_like_boot = (
+        state["map_group"] == 0
+        and state["map_number"] == 0
+        and state["map_status"] == 0
+        and is_continue_menu_candidate(state)
+    )
+    if boot_action is not None and (intro_action is None or continue_like_boot):
+        return boot_action
+
+    if intro_action is not None:
+        if follow_priority:
+            intro_action = None
+        stalled_intro = (
+            phase in ("OAK_INTRO", "MOM_INTRO")
+            and intro_stall_frames >= 180
+            and state["script_running"] == 0
+            and state["in_menu"] == 0
+        )
+        if intro_action is not None and not stalled_intro:
+            return intro_action
+        # Stalled OAK/MOM_INTRO: boot recovery must outrank random walkthrough so
+        # the agent keeps pressing START/A on the continue screen instead of
+        # wandering with movement keys when boot_progress_latched suppressed
+        # CONTINUE_MENU phase detection.
+        if stalled_intro and boot_action is not None:
+            return boot_action
+
+    if state["battle_mode"] == 0:
+        follow_action = follow_heuristic(state, stuck_count, last_action)
+        if same_map(state):
+            return smooth_candidate(state, follow_action, last_action, action_history)
+
+        # If host sync is temporarily missing, avoid random interactions.
+        if desync_frames < 36:
+            if recovery_action in OVERWORLD_ACTIONS:
+                return smooth_candidate(state, recovery_action, last_action, action_history)
+            idle = "NONE"
+            return smooth_candidate(state, idle, last_action, action_history)
+
+        # If host sync stays missing, keep playing via walkthrough fallback.
+        fallback = walkthrough_fallback_action(
+            state, map_name, last_action, stuck_count, intro_stall_frames
+        )
+        key = state_key(state)
+        allowed = OVERWORLD_ACTIONS
+        q_best = memory.best_action(key, allowed, fallback)
+        clone_best = memory.best_clone_action(key, allowed, fallback)
+
+        ollama_pick = None
+        if ollama and ((desync_frames % 90) == 0 or stuck_count >= 6 or intro_stall_frames >= 48):
+            ollama_pick = ollama.choose(
+                state,
+                allowed,
+                fallback,
+                q_best,
+                clone_best,
+                phase,
+                objective,
+                map_name,
+                memory.bad,
+                memory.reward_snapshot(),
+                progress_context=(progress_snapshot.to_prompt_dict() if progress_snapshot is not None else {}),
+                planner_context=(planner_packet.to_prompt_dict() if planner_packet is not None else {}),
+            )
+        reward_state = memory.reward_snapshot()
+        broccoli_dislike = float(reward_state.get('broccoli_dislike', 1.35) or 1.35)
+
+        scores = {}
+        for action in allowed:
+            q = memory.qvalue(key, action)
+            c = memory.clonevalue(key, action)
+            scores[action] = (q * 0.48) + (math.log1p(c) * 1.05)
+
+        smart_scores = smart_policy.score_actions(
+            state,
+            allowed,
+            memory_clone=memory.clone,
+            guide_action=guide_action,
+            heuristic=fallback,
+            fallback=fallback,
+            q_best=q_best,
+            clone_best=clone_best,
+            ollama_pick=ollama_pick,
+            last_action=last_action,
+            action_history=action_history,
+            stuck_count=stuck_count,
+            repeated_action_streak=repeated_action_streak,
+            intro_stall_frames=intro_stall_frames,
+            desync_frames=desync_frames,
+        )
+        for action, value in smart_scores.items():
+            scores[action] = scores.get(action, 0.0) + float(value)
+
+        meta_scores = meta_policy.score_actions(
+            state,
+            allowed,
+            reward_state=reward_state,
+            objective=objective,
+            map_name=map_name,
+            guide_action=guide_action,
+            fallback=fallback,
+            last_action=last_action,
+            repeated_action_streak=repeated_action_streak,
+            stuck_count=stuck_count,
+            desync_frames=desync_frames,
+        )
+        for action, value in meta_scores.items():
+            scores[action] = scores.get(action, 0.0) + float(value)
+
+        wall_scores = wall_avoidance.score_actions(
+            state,
+            allowed,
+            guide_action=guide_action,
+            fallback_action=fallback,
+            last_action=last_action,
+            stuck_count=stuck_count,
+        )
+        for action, value in wall_scores.items():
+            scores[action] = scores.get(action, 0.0) + float(value)
+
+        if planner_packet is not None:
+            for action, value in dict(getattr(planner_packet, "scores", {}) or {}).items():
+                if action in allowed:
+                    scores[action] = scores.get(action, 0.0) + float(value)
+        if recovery_action in allowed:
+            scores[recovery_action] = scores.get(recovery_action, 0.0) + (2.6 if stuck_count >= 4 else 1.3)
+        if mission_packet is not None:
+            for action, value in dict(getattr(mission_packet, "scores", {}) or {}).items():
+                if action in allowed:
+                    scores[action] = scores.get(action, 0.0) + float(value) * CONFIG.mission_script_bonus
+
+        scores[fallback] = scores.get(fallback, 0.0) + 3.2
+        if guide_action in allowed:
+            scores[guide_action] = scores.get(guide_action, 0.0) + 2.8
+        scores[q_best] = scores.get(q_best, 0.0) + 0.9
+        scores[clone_best] = scores.get(clone_best, 0.0) + 1.8
+        if ollama_pick in allowed:
+            scores[ollama_pick] = scores.get(ollama_pick, 0.0) + 0.55
+
+        if "NONE" in scores:
+            none_penalty = 0.0
+            if guide_action and guide_action != "NONE":
+                none_penalty += 1.05 * broccoli_dislike
+            if stuck_count >= 4 or intro_stall_frames >= 40:
+                none_penalty += 0.85 * broccoli_dislike
+            if none_penalty > 0.0:
+                scores["NONE"] = scores.get("NONE", 0.0) - none_penalty
+
+        candidate = max(scores.items(), key=lambda kv: kv[1])[0]
+        return smooth_candidate(state, candidate, last_action, action_history)
+
+    key = state_key(state)
+    allowed = allowed_actions(state, intro_action)
+    heuristic = heuristic_action(state, intro_action, stuck_count, last_action)
+    q_best = memory.best_action(key, allowed, heuristic)
+    clone_best = memory.best_clone_action(key, allowed, heuristic)
+
+    ollama_pick = None
+    if ollama:
+        consult = False
+        if state["battle_mode"] != 0:
+            consult = True
+        elif stuck_count >= 10:
+            consult = True
+        if consult:
+            ollama_pick = ollama.choose(
+                state,
+                allowed,
+                heuristic,
+                q_best,
+                clone_best,
+                phase,
+                objective,
+                map_name,
+                memory.bad,
+                memory.reward_snapshot(),
+                progress_context=(progress_snapshot.to_prompt_dict() if progress_snapshot is not None else {}),
+                planner_context=(planner_packet.to_prompt_dict() if planner_packet is not None else {}),
+            )
+
+    reward_state = memory.reward_snapshot()
+    broccoli_dislike = float(reward_state.get('broccoli_dislike', 1.35) or 1.35)
+
+    scores = {}
+    for action in allowed:
+        q = memory.qvalue(key, action)
+        c = memory.clonevalue(key, action)
+        scores[action] = (q * 0.55) + (math.log1p(c) * 0.95)
+
+    smart_scores = smart_policy.score_actions(
+        state,
+        allowed,
+        memory_clone=memory.clone,
+        guide_action=guide_action,
+        heuristic=heuristic,
+        fallback=heuristic,
+        q_best=q_best,
+        clone_best=clone_best,
+        ollama_pick=ollama_pick,
+        last_action=last_action,
+        action_history=action_history,
+        stuck_count=stuck_count,
+        repeated_action_streak=repeated_action_streak,
+        intro_stall_frames=intro_stall_frames,
+        desync_frames=desync_frames,
+    )
+    for action, value in smart_scores.items():
+        scores[action] = scores.get(action, 0.0) + float(value)
+
+    meta_scores = meta_policy.score_actions(
+        state,
+        allowed,
+        reward_state=reward_state,
+        objective=objective,
+        map_name=map_name,
+        guide_action=guide_action,
+        fallback=heuristic,
+        last_action=last_action,
+        repeated_action_streak=repeated_action_streak,
+        stuck_count=stuck_count,
+        desync_frames=desync_frames,
+    )
+    for action, value in meta_scores.items():
+        scores[action] = scores.get(action, 0.0) + float(value)
+
+    if planner_packet is not None:
+        for action, value in dict(getattr(planner_packet, "scores", {}) or {}).items():
+            if action in allowed:
+                scores[action] = scores.get(action, 0.0) + float(value)
+    if recovery_action in allowed:
+        scores[recovery_action] = scores.get(recovery_action, 0.0) + (2.2 if stuck_count >= 4 or intro_stall_frames >= 24 else 0.9)
+    if mission_packet is not None:
+        for action, value in dict(getattr(mission_packet, "scores", {}) or {}).items():
+            if action in allowed:
+                scores[action] = scores.get(action, 0.0) + float(value) * CONFIG.mission_script_bonus
+    if battle_packet is not None:
+        for action, value in dict(getattr(battle_packet, "scores", {}) or {}).items():
+            if action in allowed:
+                scores[action] = scores.get(action, 0.0) + float(value) * CONFIG.battle_brain_bonus
+    if capture_packet is not None:
+        for action, value in dict(getattr(capture_packet, "scores", {}) or {}).items():
+            if action in allowed:
+                scores[action] = scores.get(action, 0.0) + float(value) * CONFIG.capture_bonus
+
+    scores[heuristic] = scores.get(heuristic, 0.0) + 2.2
+    if guide_action in allowed:
+        scores[guide_action] = scores.get(guide_action, 0.0) + 2.4
+    scores[q_best] = scores.get(q_best, 0.0) + 0.75
+    scores[clone_best] = scores.get(clone_best, 0.0) + 1.2
+    if ollama_pick:
+        scores[ollama_pick] = scores.get(ollama_pick, 0.0) + (0.8 if state["battle_mode"] != 0 else 0.35)
+
+    if "NONE" in scores:
+        none_penalty = 0.0
+        if state["battle_mode"] != 0:
+            none_penalty += 1.2 * broccoli_dislike
+        if guide_action and guide_action != "NONE":
+            none_penalty += 1.15 * broccoli_dislike
+        if stuck_count >= 6 or intro_stall_frames >= 60:
+            none_penalty += 1.1 * broccoli_dislike
+        if none_penalty > 0.0:
+            scores["NONE"] = scores.get("NONE", 0.0) - none_penalty
+
+    explore = 0.012 if memory.steps < 2400 else 0.004
+    if state["battle_mode"] != 0:
+        explore *= 0.6
+    elif same_map(state):
+        dist = abs(state["host_x"] - state["x"]) + abs(state["host_y"] - state["y"])
+        if dist >= 3:
+            explore = min(explore, 0.0025)
+
+    if random.random() < explore:
+        candidate = random.choice(allowed)
+    else:
+        candidate = max(scores.items(), key=lambda kv: kv[1])[0]
+    return smooth_candidate(state, candidate, last_action, action_history)
+
+
+def connect_loop(host, port):
+    while True:
+        try:
+            sock = socket.create_connection((host, port), timeout=2.0)
+            sock.settimeout(2.0)
+            return sock
+        except OSError:
+            time.sleep(1.0)
+
+
+def load_text(path: Path, limit: int):
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    raw = " ".join(raw.split())
+    if len(raw) > limit:
+        raw = raw[:limit]
+    return raw
+
+
+def append_trace(path: Path | None, line: str):
+    if path is None:
+        return
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Silver autonomous controller via Ollama")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=58888)
+    parser.add_argument("--model", default="llama3.2")
+    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--timeout", type=float, default=1.8)
+    parser.add_argument("--memory", default=str(Path(__file__).with_name("training_data")))
+    parser.add_argument("--knowledge", default=str(Path(__file__).with_name("silver_knowledge.txt")))
+    parser.add_argument("--walkthrough", default=str(Path(__file__).with_name("silver_walkthrough.txt")))
+    parser.add_argument("--controls", default=str(Path(__file__).with_name("silver_controls_mastery.txt")))
+    parser.add_argument("--map-constants", default=default_map_constants_path())
+    parser.add_argument("--debug-log", default=str(Path(__file__).with_name("silver_agent_trace.log")))
+    parser.add_argument("--name-slot", type=int, default=0, help="1-4 preset name choice (0 = auto from model)")
+    args = parser.parse_args()
+
+    memory = build_memory(Path(args.memory))
+    smart_policy = SmartPolicyRuntime()
+    meta_policy = MetaPolicyRuntime()
+    progress_tracker = ProgressTrackerRuntime()
+    task_planner = TaskPlannerRuntime()
+    recovery = RecoveryRuntime()
+    wall_avoidance = WallAvoidanceRuntime()
+    ai_root = Path(__file__).resolve().parent
+    signal_map = SignalMapRuntime(ai_root / CONFIG.dashboard_dirname / CONFIG.signal_map_name)
+    mission_scripts = MissionScriptRuntime()
+    battle_brain = BattleBrainRuntime()
+    capture_planner = CapturePlannerRuntime()
+    teacher_guard = TeacherGuardRuntime(ai_root / CONFIG.dashboard_dirname / CONFIG.teacher_guard_name)
+    replay_logger = ReplayLoggerRuntime(ai_root / CONFIG.replay_dirname / f"replay_{int(time.time())}.jsonl")
+    dashboard = DebugDashboardRuntime(
+        ai_root / CONFIG.dashboard_dirname / CONFIG.dashboard_json_name,
+        ai_root / CONFIG.dashboard_dirname / CONFIG.dashboard_text_name,
+    )
+    knowledge = load_text(Path(args.knowledge), 2400)
+    walkthrough = load_text(Path(args.walkthrough), 12500)
+    controls = load_text(Path(args.controls), 4200)
+    map_index = load_map_index(Path(args.map_constants)) if args.map_constants else {}
+    ollama = Ollama(args.model, args.ollama_url, args.timeout, knowledge, walkthrough, controls)
+    intro = IntroDirector(args.model, args.name_slot)
+    trace_path = Path(args.debug_log) if args.debug_log else None
+    trace_tick = 0
+    append_trace(
+        trace_path,
+        f"=== session start t={int(time.time())} model={args.model} name_slot={args.name_slot} ===",
+    )
+
+    print(f"[silver-agent] connecting to mGBA bridge {args.host}:{args.port}", flush=True)
+    sock = connect_loop(args.host, args.port)
+    print(
+        f"[silver-agent] connected; model={args.model}; name_slot={intro.name_slot}",
+        flush=True,
+    )
+
+    prev_state = None
+    prev_key = None
+    prev_action = None
+    prev_guide_action = None
+    prev_stall_pressure = 0
+    prev_manual_override = False
+    prev_reward_value = 0.0
+    rx = ""
+    step_since_save = 0
+    last_hot_reload = time.time()
+    stuck_count = 0
+    desync_frames = 0
+    intro_stall_frames = 0
+    last_action = "NONE"
+    action_history = deque(maxlen=10)
+    boot_hammer_frames = 0
+    repeated_action = None
+    repeated_action_streak = 0
+    last_manual_demo_action = None
+    manual_demo_hold = 0
+
+    while True:
+        try:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError("socket closed")
+            rx += chunk.decode("utf-8", errors="replace")
+        except (socket.timeout, TimeoutError):
+            continue
+        except OSError:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            print("[silver-agent] reconnecting bridge...", flush=True)
+            sock = connect_loop(args.host, args.port)
+            print("[silver-agent] reconnected", flush=True)
+            append_trace(trace_path, f"reconnect t={int(time.time())}")
+            rx = ""
+            prev_state = None
+            prev_key = None
+            prev_action = None
+            prev_guide_action = None
+            prev_stall_pressure = 0
+            prev_manual_override = False
+            stuck_count = 0
+            desync_frames = 0
+            intro_stall_frames = 0
+            last_action = "NONE"
+            action_history.clear()
+            boot_hammer_frames = 0
+            repeated_action = None
+            repeated_action_streak = 0
+            last_manual_demo_action = None
+            manual_demo_hold = 0
+            continue
+
+        while True:
+            at = rx.find("\n")
+            if at < 0:
+                break
+            line = rx[:at]
+            rx = rx[at + 1 :]
+            state = parse_state(line)
+            if not state:
+                continue
+
+            map_name = map_name_for_state(state, map_index)
+            signal_snapshot = signal_map.summarize(state, map_name)
+            objective = story_objective(state, map_name)
+            progress_snapshot = progress_tracker.build_snapshot(state, map_name)
+            intro_action = intro.decide(state)
+            phase = intro.phase(state)
+            key = state_key(state)
+            allowed = allowed_actions(state, intro_action)
+            if same_map(state):
+                desync_frames = 0
+            else:
+                desync_frames = min(60000, desync_frames + 1)
+
+            if prev_state is not None:
+                unchanged = (
+                    prev_state["map_group"] == state["map_group"]
+                    and prev_state["map_number"] == state["map_number"]
+                    and prev_state["x"] == state["x"]
+                    and prev_state["y"] == state["y"]
+                    and prev_state["in_menu"] == state["in_menu"]
+                    and prev_state["script_running"] == state["script_running"]
+                    and prev_state["map_status"] == state["map_status"]
+                    and prev_state["menu_items"] == state["menu_items"]
+                )
+                if unchanged:
+                    intro_stall_frames = min(12000, intro_stall_frames + 1)
+                else:
+                    intro_stall_frames = 0
+
+            force_boot_action = None
+            if (
+                boot_hammer_frames > 0
+                and state["battle_mode"] == 0
+                and state["map_group"] == 0
+                and state["map_number"] == 0
+                and state["map_status"] in (0, 255)
+            ):
+                boot_state = (
+                    state["map_status"] in (0, 255)
+                    or state["script_running"] != 0
+                    or is_continue_menu_candidate(state)
+                )
+                if boot_state:
+                    if pulse(state["frame"], 4, 2, 1):
+                        force_boot_action = "A"
+                    else:
+                        force_boot_action = "NONE"
+                    boot_hammer_frames -= 1
+                else:
+                    boot_hammer_frames = 0
+
+            if prev_state is not None and prev_action is not None and prev_key is not None:
+                if prev_action in MOVEMENT_ACTIONS and prev_state["x"] == state["x"] and prev_state["y"] == state["y"]:
+                    stuck_count += 1
+                else:
+                    stuck_count = 0
+
+                teacher = teacher_action(prev_state, state)
+                if teacher:
+                    memory.observe_teacher(prev_key, teacher)
+
+                reward = reward_for_transition(prev_state, state, prev_action)
+                if prev_action == repeated_action:
+                    repeated_action_streak += 1
+                else:
+                    repeated_action = prev_action
+                    repeated_action_streak = 1
+                reward_signal = evaluate_reward_signal(
+                    prev_state,
+                    state,
+                    prev_action,
+                    prev_guide_action,
+                    prev_stall_pressure,
+                    repeated_action_streak,
+                    manual_override=prev_manual_override,
+                )
+                reward += reward_signal.reward_bonus
+                memory.record_reward_signal(
+                    reward_signal,
+                    state_key=prev_key,
+                    action=prev_action,
+                    guide_action=prev_guide_action or "NONE",
+                )
+                smart_policy.observe_transition(
+                    prev_state,
+                    prev_action,
+                    state,
+                    reward,
+                    reward_signal=reward_signal,
+                    guide_action=prev_guide_action or "NONE",
+                )
+                meta_policy.observe_transition(
+                    prev_state,
+                    prev_action,
+                    state,
+                    reward,
+                    reward_signal=reward_signal,
+                    objective=objective,
+                )
+                recovery.observe_transition(
+                    prev_state,
+                    prev_action,
+                    state,
+                    reward_signal=reward_signal,
+                )
+                wall_avoidance.observe_transition(
+                    prev_state,
+                    prev_action,
+                    state,
+                    reward_signal=reward_signal,
+                )
+                capture_planner.observe_outcome(prev_state, prev_action, state, reward_signal=reward_signal)
+                teacher_guard.observe_outcome(prev_key, prev_action, reward, prev_manual_override)
+                prev_reward_value = reward
+                memory.update(prev_key, prev_action, reward, key, allowed)
+                step_since_save += 1
+
+            stall_pressure = max(intro_stall_frames, stuck_count * 8)
+            guide_action = guide_action_for_state(
+                state,
+                map_name,
+                intro_action,
+                phase,
+                stuck_count,
+                intro_stall_frames,
+                desync_frames,
+                last_action,
+                action_history,
+            )
+            fallback_action = walkthrough_fallback_action(
+                state,
+                map_name,
+                last_action,
+                stuck_count,
+                intro_stall_frames,
+            ) if state["battle_mode"] == 0 else heuristic_action(state, intro_action, stuck_count, last_action)
+            planner_packet = task_planner.plan(
+                state,
+                map_name,
+                progress_snapshot,
+                objective,
+                guide_action=guide_action,
+                fallback_action=fallback_action,
+            )
+            mission_packet = mission_scripts.script(
+                state,
+                map_name,
+                progress_snapshot,
+                guide_action=guide_action,
+                fallback_action=fallback_action,
+            )
+            battle_packet = battle_brain.choose(state, progress_snapshot, planner_packet=planner_packet)
+            capture_packet = capture_planner.plan(state, progress_snapshot)
+            objective = planner_packet.objective
+            if getattr(mission_packet, "objective_note", ""):
+                objective = objective + " Mission: " + mission_packet.objective_note
+            if getattr(battle_packet, "note", "") and state["battle_mode"] != 0:
+                objective = objective + " Battle: " + battle_packet.note
+            if getattr(capture_packet, "note", "") and state["battle_mode"] != 0:
+                objective = objective + " Capture: " + capture_packet.note
+            wall_scores = wall_avoidance.score_actions(
+                state,
+                allowed,
+                guide_action=guide_action,
+                fallback_action=fallback_action,
+                last_action=last_action,
+                stuck_count=stuck_count,
+            )
+            wall_summary = wall_avoidance.summary()
+            recovery_action = recovery.recommend_action(
+                state,
+                allowed,
+                guide_action=guide_action,
+                fallback_action=fallback_action,
+                last_action=last_action,
+                blocked_action=wall_summary.get('blocked_action'),
+                detour_action=wall_summary.get('detour_action'),
+            )
+            manual_override_action = detect_manual_override_action(
+                state,
+                MANUAL_ACTIONS,
+                fallback=last_action,
+            )
+            manual_override_active = bool(manual_override_action)
+            if manual_override_active:
+                if manual_override_action == last_manual_demo_action:
+                    manual_demo_hold += 1
+                else:
+                    last_manual_demo_action = manual_override_action
+                    manual_demo_hold = 1
+                if teacher_guard.consider(key, manual_override_action, manual_demo_hold):
+                    memory.observe_teacher(key, manual_override_action)
+            else:
+                last_manual_demo_action = None
+                manual_demo_hold = 0
+
+            if manual_override_active:
+                action = manual_override_action
+            elif force_boot_action is not None:
+                action = force_boot_action
+                guide_action = force_boot_action
+            else:
+                action = pick_action(
+                    state,
+                    map_name,
+                    objective,
+                    memory,
+                    smart_policy,
+                    meta_policy,
+                    wall_avoidance,
+                    ollama,
+                    intro_action,
+                    phase,
+                    stuck_count,
+                    intro_stall_frames,
+                    desync_frames,
+                    last_action,
+                    action_history,
+                    repeated_action_streak=repeated_action_streak,
+                    guide_action=guide_action,
+                    progress_snapshot=progress_snapshot,
+                    planner_packet=planner_packet,
+                    recovery_action=recovery_action,
+                    mission_packet=mission_packet,
+                    battle_packet=battle_packet,
+                    capture_packet=capture_packet,
+                )
+            keys = ACTIONS[action]
+            packet = f"A|{keys}|2|{action}\n".encode("utf-8")
+            try:
+                sock.sendall(packet)
+            except OSError:
+                break
+
+            trace_tick += 1
+            if trace_tick % 10 == 0 or action != last_action:
+                append_trace(
+                    trace_path,
+                    (
+                        f"f={state['frame']} a={action} phase={phase} map={state['map_group']}-{state['map_number']}"
+                        f" map_name={map_name}"
+                        f" xy={state['x']},{state['y']} host={state['host_map_group']}-{state['host_map_number']}"
+                        f" hxy={state['host_x']},{state['host_y']} ms={state['map_status']}"
+                        f" menu={state['in_menu']} script={state['script_running']} jpd={state['joypad_disable']} party={state['party_count']}"
+                        f" nm={state['naming_type']} mi={state['menu_items']}"
+                        f" my={state['menu_y']} mx={state['menu_x']}"
+                        f" box={state['menu_top']},{state['menu_left']},{state['menu_bottom']},{state['menu_right']}"
+                        f" badges={state.get('badges_johto', 0) & 0xFF}/{state.get('badges_kanto', 0) & 0xFF}"
+                        f" same={1 if same_map(state) else 0} desync={desync_frames} stuck={stuck_count}"
+                        f" intro_stall={intro_stall_frames} stall_pressure={stall_pressure}"
+                        f" mood={memory.reward_snapshot().get('mood', 'steady')} cookies={memory.reward_snapshot().get('cookies_total', 0.0):.2f} broccoli={memory.reward_snapshot().get('broccoli_total', 0.0):.2f}"
+                        f" burn={memory.reward_snapshot().get('broccoli_burn_total', 0.0):.2f} repeat={repeated_action_streak}"
+                        f" milestone={progress_snapshot.milestone_key} planner={progress_snapshot.active_planner}"
+                        f" recovery={recovery_action or 'NONE'} pressure={recovery.recovery_pressure()} guide={guide_action} manual={manual_override_action or 'NONE'}"
+                        f" ai_ttl={state.get('bridge_ai_ttl', 0)} ai_keys={state.get('bridge_ai_keys', 0)} raw={state.get('raw_keys', 0)} kr={state.get('keys_read_count', 0)}"
+                    ),
+                )
+
+            dashboard.update({
+                'frame': state['frame'],
+                'map_name': map_name,
+                'map_group': state['map_group'],
+                'map_number': state['map_number'],
+                'x': state['x'],
+                'y': state['y'],
+                'host_map_group': state['host_map_group'],
+                'host_map_number': state['host_map_number'],
+                'host_x': state['host_x'],
+                'host_y': state['host_y'],
+                'phase': phase,
+                'objective': objective,
+                'milestone': progress_snapshot.milestone_label,
+                'planner': progress_snapshot.active_planner,
+                'mission_label': getattr(mission_packet, 'label', ''),
+                'battle_note': getattr(battle_packet, 'note', ''),
+                'capture_note': getattr(capture_packet, 'note', ''),
+                'cookies': memory.reward_snapshot().get('cookies_total', 0.0),
+                'broccoli': memory.reward_snapshot().get('broccoli_total', 0.0),
+                'mood': memory.reward_snapshot().get('mood', 'steady'),
+                'recovery_action': recovery_action or 'NONE',
+                'recovery_pressure': recovery.recovery_pressure(),
+                'stuck_count': stuck_count,
+                'repeat_streak': repeated_action_streak,
+                'manual_override': manual_override_action or 'NONE',
+                'teacher_summary': teacher_guard.summary(),
+                'last_action': last_action,
+                'guide_action': guide_action,
+                'chosen_action': action,
+                'wall_summary': wall_summary,
+                'signal_summary': signal_snapshot.derived,
+            })
+            signal_map.export()
+            teacher_guard.save()
+            replay_logger.log_step({
+                'frame': state['frame'],
+                'map_name': map_name,
+                'state_key': key,
+                'action': action,
+                'guide_action': guide_action,
+                'manual_override_action': manual_override_action or 'NONE',
+                'phase': phase,
+                'objective': objective,
+                'milestone_key': progress_snapshot.milestone_key,
+                'planner': progress_snapshot.active_planner,
+                'mission_key': getattr(mission_packet, 'key', ''),
+                'battle_note': getattr(battle_packet, 'note', ''),
+                'capture_note': getattr(capture_packet, 'note', ''),
+                'reward_snapshot': memory.reward_snapshot(),
+                'signal_summary': signal_snapshot.derived,
+                'wall_summary': wall_summary,
+                'recovery_pressure': recovery.recovery_pressure(),
+                'prev_reward_value': prev_reward_value,
+            })
+
+            prev_state = state
+            prev_key = key
+            prev_action = action
+            prev_guide_action = guide_action
+            prev_stall_pressure = stall_pressure
+            prev_manual_override = manual_override_active
+            last_action = action
+            action_history.append(action)
+
+            if step_since_save >= 120:
+                memory.save()
+                step_since_save = 0
+
+            # Hot-reload training data from disk every 5 real seconds so the
+            # agent continuously picks up merged Q-tables written by the 10x runner.
+            _now_t = time.time()
+            if _now_t - last_hot_reload >= 5.0:
+                memory.hot_reload_q()
+                last_hot_reload = _now_t
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

@@ -1,0 +1,71 @@
+Pokemon Silver practical playbook (short form):
+
+MASTER GOALS (all required):
+- Catch one of every Pokemon species (251 total).
+- Defeat all 16 gym leaders (8 Johto + 8 Kanto).
+- Defeat the Elite Four and Champion Lance.
+- Defeat Red on Mt. Silver.
+- Collect all findable items, TMs, and key items.
+
+Controls and intent:
+- A confirms/talks/interacts/picks up items.
+- B cancels.
+- Start opens menu.
+- D-pad moves.
+- In heavy dialogue and cutscenes, prioritize A to advance quickly.
+- This agent only controls Pokemon Silver (never Gold).
+
+CATCHING PRIORITY (most important behavior):
+- In wild battles, ALWAYS attempt to catch Pokemon you don't already own.
+- Weaken wild Pokemon to low HP before throwing balls.
+- If HP is already low (<50), go straight to PACK to throw a ball.
+- Keep 20+ Pokeballs at all times. Buy more at every mart visit.
+- Use the best available ball type (Ultra > Great > Poke).
+- NEVER run from a wild Pokemon you haven't caught yet.
+- After catching, continue to explore for more species.
+
+ITEM COLLECTION PRIORITY:
+- Walk over and press A on every item ball visible on the ground.
+- Talk to NPCs who offer items (gifts, TMs, key items).
+- Check every building and side room for hidden items.
+- Use Itemfinder when available to find hidden ground items.
+- In caves/dungeons, explore every dead end for items.
+
+Early-game progression priorities:
+0. On title screen, press Start and choose CONTINUE when save data exists.
+1. Finish Oak intro and naming quickly.
+2. Set clock/day only when prompted.
+3. Leave New Bark, get to Mr. Pokemon's house.
+4. Return to Elm after obtaining the Mystery Egg.
+5. Get Poke Balls IMMEDIATELY from the catching tutorial.
+6. CATCH everything on Route 29 and 30 before Violet City.
+7. Route progression: Cherrygrove -> Violet -> first gym.
+
+Overworld behavior:
+- Follow host position when on same map.
+- Prefer shortest Manhattan path.
+- If stuck, try perpendicular movement for a short burst.
+- Interact with doors/warps/NPCs using A when directly adjacent.
+- If host telemetry is unavailable, use walkthrough fallback plan.
+- ALWAYS pick up items: walk to item balls and press A.
+- Explore thoroughly: check every route branch and dead end.
+
+Battle behavior:
+- Wild battles: CATCH first priority, fight only to weaken.
+- If species already caught AND balls are low, can defeat or flee.
+- Trainer battles: select highest-damage move (FIGHT top-left).
+- Gym leaders: prepare type advantages, heal before entering gym.
+- Elite Four: save before entering, heal between battles.
+- Avoid idle loops in menu states.
+
+Resource management:
+- Visit Pokemart in every city. Buy balls and healing items.
+- Heal at Pokemon Center when any mon is below 50% HP.
+- Keep variety of ball types for different situations.
+- Save Ultra Balls for legendaries and rare Pokemon.
+
+Safety and consistency:
+- Avoid random Start menu opens unless blocked.
+- If at title/continue menu, prioritize loading CONTINUE.
+- During script/menu lock states, use A over movement.
+- Keep movement consistent and avoid oscillation.

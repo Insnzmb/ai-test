@@ -1,0 +1,16 @@
+2026-03-09 update
+
+Task 1 - smarter Silver AI
+- Reduced pointless A-button spam while following host.
+- Added a tighter follow bubble so Silver stops crowding/talking to the host when already adjacent.
+- Improved stuck recovery patterns.
+- Blended teacher-memory / learned follow hints into same-map chasing when they align with the host vector.
+- Added extra learning penalties for useless A presses and failed movement.
+
+Task 2 - multiplayer partner position fix
+- Fixed co-op world position telemetry to use player/object world coordinates instead of camera origin values.
+- Partner render now prefers remote OBJECT_MAP coordinates for in-world placement.
+- HUD now shows both player world coordinates and camera coordinates for debugging.
+
+Notes
+- This is a code patch / packaging pass. It was syntax-checked for Python, but not live-played inside Windows mGBA in this environment.

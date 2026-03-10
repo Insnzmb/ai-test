@@ -1,0 +1,61 @@
+FULL ADDITIVE UPDATE PACKAGE
+
+This package keeps the old systems and adds the missing glue layers that were still needed:
+
+New files added
+- silver_runtime_config.py
+  Centralized runtime knobs for dashboard, replay logging, mission, battle, capture, and teacher-guard behavior.
+
+- silver_signal_map.py
+  Creates a readable signal map over the emulator telemetry and exports a runtime signal snapshot.
+
+- silver_mission_scripts.py
+  Adds critical-gate mission logic for the known choke points: Whitney/SquirtBottle/Sudowoodo, Lighthouse medicine, Rocket Hideout, Radio Tower, Dragon Den, League road, Kanto unlock errands, and Mt. Silver/Red.
+
+- silver_battle_brain.py
+  Adds a stronger battle policy layer that prefers productive fight/pack/party routing instead of inert menu wobbling.
+
+- silver_capture_planner.py
+  Adds catch-focused battle pressure for wild encounters, using enemy species/HP/ball availability and simple attempt history.
+
+- silver_teacher_guard.py
+  Adds teacher-demo trust/quarantine logic so manual override examples can be recorded, scored, and isolated when they keep causing bad outcomes.
+
+- silver_replay_logger.py
+  Writes structured replay steps to training_data/replays/ for post-run review.
+
+- silver_debug_dashboard.py
+  Writes a live text and JSON dashboard into logs/ so you can see what the AI thinks it is doing.
+
+Updated files
+- silver_ollama_agent.py
+  Integrated all new additive layers into the live loop.
+
+- silver_test_harness.py
+  Extended smoke tests to validate the new systems.
+
+What the new integrations do
+- The agent now builds a readable signal snapshot every tick.
+- The agent now applies critical mission scripts on top of the older walkthrough/planner logic.
+- The agent now applies a battle brain and a catch planner during battles.
+- Manual override learning now passes through a teacher guard so repeated bad demos can be quarantined instead of endlessly poisoning the clone memory.
+- A live dashboard is written continuously.
+- Replay logs are written continuously.
+- Ollama now receives progress/planner context directly in its prompt.
+
+Files written at runtime
+- logs/ai_live_dashboard.txt
+- logs/ai_live_dashboard.json
+- logs/silver_signal_map_runtime.json
+- logs/silver_teacher_guard_state.json
+- training_data/replays/replay_<timestamp>.jsonl
+
+Validation
+- Python compile passed.
+- silver_test_harness.py passed.
+
+Wall avoidance additive update:
+- Added silver_wall_avoidance.py for per-tile blocked-direction memory, directional cooldowns, and detour scoring.
+- Integrated wall-aware recovery and action scoring into silver_ollama_agent.py without deleting old systems.
+- Updated recovery controller and debug dashboard to respect blocked directions and show wall state.
+- Extended silver_test_harness.py with repeated-wall-bump smoke coverage.

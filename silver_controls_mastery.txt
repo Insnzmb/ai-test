@@ -1,0 +1,50 @@
+Core controls:
+- A: confirm, talk, advance text, inspect.
+- B: cancel/back, close menu, cancel wrong submenu.
+- START: open party/pack/save menu in overworld.
+- SELECT: toggle quick interface where applicable.
+- D-pad: movement and menu cursor.
+
+Control discipline:
+- Prefer taps over held buttons on title, continue, and dialogue transitions.
+- In dialogue/script states: prioritize A taps; never spam START repeatedly.
+- In movement: keep direction stable for multiple frames to avoid jitter.
+- If blocked for many frames: sidestep, reface NPC/object, then A.
+
+Battle doctrine:
+- Wild battle: weaken target, then catch when HP is low and balls are available.
+- Trainer battle: prioritize safe KO path over risky setup.
+- If in wrong submenu: B out to top-level command menu.
+- Keep PP and HP sustainable; route to healing when party is weak.
+
+Menu doctrine:
+- Always collapse to top-level with B before opening a new path.
+- In item/party menus: one decision at a time, avoid oscillating left-right spam.
+- Use START in overworld only when needed for party/pack/save operations.
+
+Intro and naming doctrine:
+- Title flow: use A taps to clear logos and reach the continue/new game menu.
+- New game selection: bias cursor UP, then A to avoid getting trapped in options.
+- Name choice menu: move to NEW NAME at top, then A to open keyboard entry.
+- Name keyboard prep: drive cursor to top-left first (UP/LEFT taps) before typing.
+- Name entry keyboard: spell OLLAMA with D-pad + A, then START and A to confirm.
+- If naming stalls: B once, move UP, then A to re-enter and continue naming.
+
+Progression doctrine (full-game ladder):
+1) Intro/new game: reach movement control, clear mom/clock flow, leave home.
+2) Starter setup: Elm intro, route progression, first rival milestones.
+3) Johto campaign: obtain 8 Johto badges while resolving major story gates.
+4) League transition: prep team, clear Victory Road flow, defeat Elite Four/Champion.
+5) Kanto campaign: collect 8 Kanto badges with efficient healing/shop loops.
+6) Endgame: unlock Mt. Silver route and defeat Red.
+
+Navigation strategy:
+- If same-map host data exists: follow host as highest priority.
+- If host sync missing: pursue current objective map transitions and NPC triggers.
+- Use repeated talk attempts (A taps) near likely trigger tiles/NPCs.
+- Recover from stalls by short detours, then return to objective direction.
+
+Reliability rules:
+- Avoid holding conflicting inputs on consecutive frames.
+- Prefer deterministic recovery sequences over random thrashing.
+- When uncertain, re-center: close menus (B), re-engage objective with movement + A.
